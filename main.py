@@ -2,6 +2,8 @@ import io
 import logging
 import os
 import threading
+import time
+import gc
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -19,16 +21,21 @@ from config import MODEL_REPO, MAX_IMAGE_MB
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("imager-api")
 
-# Caché de modelos: {repo_id: (model, transform)}
+# ============================================================
+# CONFIGURACIÓN DEL CACHÉ DE MODELOS
+# ============================================================
+# Tiempo (segundos) que un modelo se queda cargado tras la última petición
+MODEL_TTL_SECONDS = int(os.getenv("MODEL_TTL_SECONDS", "300"))  # 5 minutos
+
+# Caché: {repo_id: {"model": m, "transform": t, "last_used": timestamp}}
 MODELS_CACHE = {}
-model_lock = threading.Lock()
+cache_lock = threading.Lock()
 
 # Lista blanca de modelos permitidos
 ALLOWED_MODELS = {
     "imagers/imager-1",
     "imagers/imager-1-tiny",
     "imagers/imager-1-pro",
-    "imagers/imager-2",
 }
 
 
@@ -46,7 +53,6 @@ def normalize_repo(value: str) -> str:
     return value
 
 
-# Normalizar los permitidos
 ALLOWED_NORMALIZED = {normalize_repo(m) for m in ALLOWED_MODELS}
 
 
@@ -59,17 +65,73 @@ def detect_architecture(state_dict):
     return "convnext_small"
 
 
+def unload_model(repo_id: str):
+    """Libera la RAM del modelo."""
+    with cache_lock:
+        if repo_id in MODELS_CACHE:
+            del MODELS_CACHE[repo_id]
+            log.info("🗑️ Modelo descargado de RAM: %s", repo_id)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def unload_all_models():
+    """Libera TODOS los modelos de RAM."""
+    with cache_lock:
+        loaded = list(MODELS_CACHE.keys())
+        MODELS_CACHE.clear()
+    for m in loaded:
+        log.info("🗑️ Modelo descargado: %s", m)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def cleanup_worker():
+    """Hilo que cada 60s libera modelos inactivos."""
+    while True:
+        try:
+            time.sleep(60)
+            now = time.time()
+            to_unload = []
+            with cache_lock:
+                for repo_id, entry in MODELS_CACHE.items():
+                    if now - entry["last_used"] > MODEL_TTL_SECONDS:
+                        to_unload.append(repo_id)
+            for repo_id in to_unload:
+                unload_model(repo_id)
+        except Exception as e:
+            log.error("Cleanup worker error: %s", e)
+
+
 def load_model_by_repo(repo_id: str):
-    """Carga un modelo y lo cachea. Devuelve (model, transform)."""
+    """
+    Carga un modelo y lo cachea. Solo 1 modelo en RAM a la vez.
+    Devuelve (model, transform).
+    """
     repo_id = normalize_repo(repo_id)
 
     if repo_id not in ALLOWED_NORMALIZED:
-        raise ValueError(f"Model '{repo_id}' is not allowed.")
+        raise ValueError(f"Model '{repo_id}' not allowed.")
 
-    if repo_id in MODELS_CACHE:
-        return MODELS_CACHE[repo_id]
+    with cache_lock:
+        # Si ya está cargado, actualiza timestamp y devuélvelo
+        if repo_id in MODELS_CACHE:
+            MODELS_CACHE[repo_id]["last_used"] = time.time()
+            entry = MODELS_CACHE[repo_id]
+            return entry["model"], entry["transform"]
 
-    log.info("Loading model %s", repo_id)
+        # Si hay OTRO modelo cargado, descárgalo primero
+        if MODELS_CACHE:
+            log.info("🔄 Cambiando de modelo. Descargando anteriores...")
+            MODELS_CACHE.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # Cargar el modelo nuevo (fuera del lock para no bloquear)
+    log.info("📥 Cargando modelo en RAM: %s", repo_id)
     weights_path = hf_hub_download(repo_id=repo_id, filename="pytorch_model.bin")
     try:
         state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
@@ -101,8 +163,14 @@ def load_model_by_repo(repo_id: str):
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    MODELS_CACHE[repo_id] = (m, p)
-    log.info("Loaded %s (%s)", repo_id, arch)
+    with cache_lock:
+        MODELS_CACHE[repo_id] = {
+            "model": m,
+            "transform": p,
+            "last_used": time.time(),
+        }
+
+    log.info("✅ Modelo cargado en RAM: %s (%s)", repo_id, arch)
     return m, p
 
 
@@ -127,8 +195,10 @@ def analyze_technical_signals(image: Image.Image) -> dict:
         mag = np.log(np.abs(np.fft.fftshift(np.fft.fft2(arr))) + 1)
         h, w = mag.shape
         center = mag[h//4:3*h//4, w//4:3*w//4]
-        edges = np.concatenate([mag[:h//4, :].flatten(), mag[3*h//4:, :].flatten(),
-                                mag[:, :w//4].flatten(), mag[:, 3*w//4:].flatten()])
+        edges = np.concatenate([
+            mag[:h//4, :].flatten(), mag[3*h//4:, :].flatten(),
+            mag[:, :w//4].flatten(), mag[:, 3*w//4:].flatten(),
+        ])
         signals["fft_ratio"] = round(float(edges.mean() / (center.mean() + 1e-8)), 4)
     except Exception:
         pass
@@ -151,34 +221,45 @@ def analyze_technical_signals(image: Image.Image) -> dict:
     return signals
 
 
+# ============================================================
+# APP
+# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Precargar el modelo por defecto en background
-    def preload():
-        try:
-            load_model_by_repo(MODEL_REPO)
-        except Exception as e:
-            log.exception("Failed to preload default model: %s", e)
-    threading.Thread(target=preload, daemon=True).start()
+    # Lanzar worker de limpieza
+    threading.Thread(target=cleanup_worker, daemon=True).start()
+    log.info("🚀 Backend iniciado (lazy loading activado, TTL=%ds)", MODEL_TTL_SECONDS)
     yield
+    # Al apagar, descargar todo
+    unload_all_models()
 
 
-app = FastAPI(title="Imager Model API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Imager Model API", version="3.0.0", lifespan=lifespan)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False,
-                   allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins, allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"],
+)
 
 
 @app.get("/")
 def root():
-    loaded = list(MODELS_CACHE.keys())
-    return {"service": "Imager Model API", "default_model": MODEL_REPO,
-            "loaded_models": loaded, "allowed_models": sorted(ALLOWED_NORMALIZED)}
+    with cache_lock:
+        loaded = list(MODELS_CACHE.keys())
+    return {
+        "service": "Imager Model API",
+        "loaded_models": loaded,
+        "allowed_models": sorted(ALLOWED_NORMALIZED),
+        "ttl_seconds": MODEL_TTL_SECONDS,
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "loaded_models": list(MODELS_CACHE.keys())}
+    with cache_lock:
+        loaded = list(MODELS_CACHE.keys())
+    return {"status": "ok", "loaded_models": loaded}
 
 
 @app.post("/predict")
@@ -213,10 +294,15 @@ async def predict(
         raise HTTPException(status_code=503, detail=f"Model '{model}' unavailable: {str(e)[:200]}")
 
     try:
-        with model_lock, torch.inference_mode():
+        with torch.inference_mode():
             tensor = p(image).unsqueeze(0)
             logits = m(tensor)[0]
             probs = torch.softmax(logits, dim=-1).tolist()
+
+        # Marcar el modelo como usado
+        with cache_lock:
+            if normalize_repo(model) in MODELS_CACHE:
+                MODELS_CACHE[normalize_repo(model)]["last_used"] = time.time()
 
         ai_score = probs[0]
         real_score = probs[1]
