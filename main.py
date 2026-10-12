@@ -61,7 +61,10 @@ def detect_architecture(state_dict):
     keys = set(state_dict.keys())
     if "layer1.0.conv1.weight" in keys or "fc.weight" in keys:
         return "resnet50"
-    if "features.0.0.weight" in keys or "classifier.2.weight" in keys:
+    if "features.0.0.weight" in keys:
+        stem_channels = state_dict["features.0.0.weight"].shape[0]
+        if stem_channels == 128:
+            return "convnext_base"
         return "convnext_small"
     return "convnext_small"
 
@@ -152,6 +155,9 @@ def load_model_by_repo(repo_id: str):
         if arch == "resnet50":
             m = models.resnet50(weights=None)
             m.fc = nn.Linear(m.fc.in_features, 2)
+        elif arch == "convnext_base":
+            m = models.convnext_base(weights=None)
+            m.classifier[2] = nn.Linear(m.classifier[2].in_features, 2)
         else:
             m = models.convnext_small(weights=None)
             m.classifier[2] = nn.Linear(m.classifier[2].in_features, 2)
