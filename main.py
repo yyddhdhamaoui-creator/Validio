@@ -30,6 +30,7 @@ MODEL_TTL_SECONDS = int(os.getenv("MODEL_TTL_SECONDS", "300"))  # 5 minutos
 # Caché: {repo_id: {"model": m, "transform": t, "last_used": timestamp}}
 MODELS_CACHE = {}
 cache_lock = threading.Lock()
+LOAD_LOCK = threading.Lock()
 
 # Lista blanca de modelos permitidos
 ALLOWED_MODELS = {
@@ -105,6 +106,14 @@ def cleanup_worker():
             log.error("Cleanup worker error: %s", e)
 
 
+def _torch_load(path):
+    """Carga los pesos con mmap para no duplicar la RAM al leer el archivo."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 def load_model_by_repo(repo_id: str):
     """
     Carga un modelo y lo cachea. Solo 1 modelo en RAM a la vez.
@@ -115,63 +124,59 @@ def load_model_by_repo(repo_id: str):
     if repo_id not in ALLOWED_NORMALIZED:
         raise ValueError(f"Model '{repo_id}' not allowed.")
 
-    with cache_lock:
-        # Si ya está cargado, actualiza timestamp y devuélvelo
-        if repo_id in MODELS_CACHE:
-            MODELS_CACHE[repo_id]["last_used"] = time.time()
-            entry = MODELS_CACHE[repo_id]
-            return entry["model"], entry["transform"]
+    with LOAD_LOCK:
+        with cache_lock:
+            if repo_id in MODELS_CACHE:
+                MODELS_CACHE[repo_id]["last_used"] = time.time()
+                entry = MODELS_CACHE[repo_id]
+                return entry["model"], entry["transform"]
 
-        # Si hay OTRO modelo cargado, descárgalo primero
-        if MODELS_CACHE:
-            log.info("🔄 Cambiando de modelo. Descargando anteriores...")
-            MODELS_CACHE.clear()
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if MODELS_CACHE:
+                log.info("🔄 Cambiando de modelo. Descargando anteriores...")
+                MODELS_CACHE.clear()
 
-    # Cargar el modelo nuevo (fuera del lock para no bloquear)
-    log.info("📥 Cargando modelo en RAM: %s", repo_id)
-    weights_path = hf_hub_download(repo_id=repo_id, filename="pytorch_model.bin")
-    try:
-        state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
-    except TypeError:
-        state_dict = torch.load(weights_path, map_location="cpu")
+        gc.collect()
 
-    if isinstance(state_dict, dict):
-        if "model" in state_dict:
-            state_dict = state_dict["model"]
-        elif "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
+        log.info("📥 Cargando modelo en RAM: %s", repo_id)
+        weights_path = hf_hub_download(repo_id=repo_id, filename="pytorch_model.bin")
+        state_dict = _torch_load(weights_path)
 
-    arch = detect_architecture(state_dict)
+        if isinstance(state_dict, dict):
+            if "model" in state_dict:
+                state_dict = state_dict["model"]
+            elif "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
 
-    if arch == "resnet50":
-        m = models.resnet50(weights=None)
-        m.fc = nn.Linear(m.fc.in_features, 2)
-    else:
-        m = models.convnext_small(weights=None)
-        m.classifier[2] = nn.Linear(m.classifier[2].in_features, 2)
+        arch = detect_architecture(state_dict)
 
-    m.load_state_dict(state_dict, strict=True)
-    m.eval()
+        if arch == "resnet50":
+            m = models.resnet50(weights=None)
+            m.fc = nn.Linear(m.fc.in_features, 2)
+        else:
+            m = models.convnext_small(weights=None)
+            m.classifier[2] = nn.Linear(m.classifier[2].in_features, 2)
 
-    p = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
+        m.load_state_dict(state_dict, strict=True)
+        del state_dict
+        gc.collect()
+        m.eval()
 
-    with cache_lock:
-        MODELS_CACHE[repo_id] = {
-            "model": m,
-            "transform": p,
-            "last_used": time.time(),
-        }
+        p = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
 
-    log.info("✅ Modelo cargado en RAM: %s (%s)", repo_id, arch)
-    return m, p
+        with cache_lock:
+            MODELS_CACHE[repo_id] = {
+                "model": m,
+                "transform": p,
+                "last_used": time.time(),
+            }
+
+        log.info("✅ Modelo cargado en RAM: %s (%s)", repo_id, arch)
+        return m, p
 
 
 def analyze_technical_signals(image: Image.Image) -> dict:
@@ -226,11 +231,9 @@ def analyze_technical_signals(image: Image.Image) -> dict:
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Lanzar worker de limpieza
     threading.Thread(target=cleanup_worker, daemon=True).start()
     log.info("🚀 Backend iniciado (lazy loading activado, TTL=%ds)", MODEL_TTL_SECONDS)
     yield
-    # Al apagar, descargar todo
     unload_all_models()
 
 
@@ -299,7 +302,6 @@ async def predict(
             logits = m(tensor)[0]
             probs = torch.softmax(logits, dim=-1).tolist()
 
-        # Marcar el modelo como usado
         with cache_lock:
             if normalize_repo(model) in MODELS_CACHE:
                 MODELS_CACHE[normalize_repo(model)]["last_used"] = time.time()
