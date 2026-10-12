@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import gc
+import math
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -25,12 +26,21 @@ log = logging.getLogger("imager-api")
 # CONFIGURACIÓN DEL CACHÉ DE MODELOS
 # ============================================================
 # Tiempo (segundos) que un modelo se queda cargado tras la última petición
-MODEL_TTL_SECONDS = int(os.getenv("MODEL_TTL_SECONDS", "300"))  # 5 minutos
+MODEL_TTL_SECONDS = int(os.getenv("MODEL_TTL_SECONDS", "60"))  # 1 minuto sin uso
+CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "10"))  # revisar cada 10 s
 
 # Caché: {repo_id: {"model": m, "transform": t, "last_used": timestamp}}
 MODELS_CACHE = {}
 cache_lock = threading.Lock()
 LOAD_LOCK = threading.Lock()
+
+# bfloat16 usa la mitad de RAM que float32 para los pesos.
+# Para volver a float32 en Railway: MODEL_DTYPE=float32
+MODEL_DTYPE = (
+    torch.float32
+    if os.getenv("MODEL_DTYPE", "float32").lower() == "float32"
+    else torch.bfloat16
+)
 
 # Lista blanca de modelos permitidos
 ALLOWED_MODELS = {
@@ -55,6 +65,38 @@ def normalize_repo(value: str) -> str:
 
 
 ALLOWED_NORMALIZED = {normalize_repo(m) for m in ALLOWED_MODELS}
+
+
+def finite_or_none(value):
+    """Devuelve el número solo si es finito; JSON no admite NaN ni infinito."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def release_memory():
+    """Devuelve al sistema la RAM liberada tras descargar un modelo (glibc)."""
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def clean_json(obj):
+    """Recorre la respuesta completa y reemplaza NaN/infinito por None."""
+    if isinstance(obj, dict):
+        return {k: clean_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [clean_json(v) for v in obj]
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    return obj
 
 
 def detect_architecture(state_dict):
@@ -96,7 +138,7 @@ def cleanup_worker():
     """Hilo que cada 60s libera modelos inactivos."""
     while True:
         try:
-            time.sleep(60)
+            time.sleep(CLEANUP_INTERVAL)
             now = time.time()
             to_unload = []
             with cache_lock:
@@ -105,6 +147,8 @@ def cleanup_worker():
                         to_unload.append(repo_id)
             for repo_id in to_unload:
                 unload_model(repo_id)
+            if to_unload:
+                release_memory()
         except Exception as e:
             log.error("Cleanup worker error: %s", e)
 
@@ -162,10 +206,11 @@ def load_model_by_repo(repo_id: str):
             m = models.convnext_small(weights=None)
             m.classifier[2] = nn.Linear(m.classifier[2].in_features, 2)
 
-        m.load_state_dict(state_dict, strict=True)
+        m.load_state_dict(state_dict, strict=True, assign=True)
         del state_dict
         gc.collect()
         m.eval()
+        m = m.to(MODEL_DTYPE)
 
         p = transforms.Compose([
             transforms.Resize(256),
@@ -221,6 +266,9 @@ def analyze_technical_signals(image: Image.Image) -> dict:
         signals["noise_std"] = round(float(noise.std()), 2)
     except Exception:
         pass
+
+    signals["fft_ratio"] = finite_or_none(signals["fft_ratio"])
+    signals["noise_std"] = finite_or_none(signals["noise_std"])
 
     score = 0
     if not signals["has_exif"]: score += 2
@@ -304,19 +352,26 @@ async def predict(
 
     try:
         with torch.inference_mode():
-            tensor = p(image).unsqueeze(0)
-            logits = m(tensor)[0]
+            tensor = p(image).unsqueeze(0).to(next(m.parameters()).dtype)
+            logits = m(tensor)[0].float()
             probs = torch.softmax(logits, dim=-1).tolist()
 
         with cache_lock:
             if normalize_repo(model) in MODELS_CACHE:
                 MODELS_CACHE[normalize_repo(model)]["last_used"] = time.time()
 
+        if len(probs) < 2 or not all(math.isfinite(p) for p in probs):
+            log.error("Salida no válida del modelo %s: %s", model, probs)
+            raise HTTPException(
+                status_code=422,
+                detail="The model could not analyze this image. Try another one.",
+            )
+
         ai_score = probs[0]
         real_score = probs[1]
         is_ai = ai_score >= real_score
 
-        return {
+        return clean_json({
             "model_repo": model,
             "label": "AI-Generated" if is_ai else "Real Image",
             "isAI": is_ai,
@@ -324,7 +379,9 @@ async def predict(
             "aiScore": round(ai_score * 100, 2),
             "realScore": round(real_score * 100, 2),
             "technical_signals": technical,
-        }
+        })
+    except HTTPException:
+        raise
     except Exception as exc:
         log.exception("Prediction failed")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(exc)[:200]}")
