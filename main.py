@@ -73,6 +73,12 @@ log.info("🧵 Hilos de torch: %d", CPU_THREADS)
 # Tiempo (segundos) que un modelo se queda cargado tras la última petición
 MODEL_TTL_SECONDS = int(os.getenv("MODEL_TTL_SECONDS", "900"))  # 15 min: evita recargas de ~1 min
 CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "30"))
+USE_MMAP = os.getenv("USE_MMAP", "0") == "1"
+# DEBUG_ERRORS=1 -> el error 422 incluye la capa que produce NaN (útil para depurar desde el móvil)
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0") == "1"
+# DISABLE_MKLDNN=1 -> desactiva oneDNN siempre (algunas CPUs de la nube dan NaN con él)
+if os.getenv("DISABLE_MKLDNN", "0") == "1":
+    torch.backends.mkldnn.enabled = False
 # Modelo que se carga en segundo plano al arrancar ("" para desactivar)
 PRELOAD_MODEL = os.getenv("PRELOAD_MODEL", MODEL_REPO)
 
@@ -263,9 +269,14 @@ def load_model_by_repo(repo_id: str):
         # mmap=True: el archivo se lee de disco bajo demanda y NO se duplica en RAM.
         # Sin assign=True: los pesos se COPIAN a un modelo float32 propio, así el modelo
         # no depende de páginas mapeadas (esto evita los NaN). Resultado idéntico, menos pico de RAM.
-        try:
-            state_dict = torch.load(weights_path, map_location="cpu", weights_only=True, mmap=True)
-        except (TypeError, RuntimeError):
+        # mmap es opcional (USE_MMAP=1). Por defecto carga normal: es lo más seguro.
+        state_dict = None
+        if USE_MMAP:
+            try:
+                state_dict = torch.load(weights_path, map_location="cpu", weights_only=True, mmap=True)
+            except (TypeError, RuntimeError):
+                state_dict = None
+        if state_dict is None:
             state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
 
         if isinstance(state_dict, dict):
@@ -395,10 +406,19 @@ def run_prediction(model: str, image: Image.Image, fmt: str) -> dict:
     try:
         with INFER_LOCK:
             t_inf = time.time()
-            with torch.inference_mode():
-                tensor = p(image).unsqueeze(0).to(next(m.parameters()).dtype)
-                logits = m(tensor)[0].float()
-                probs = torch.softmax(logits, dim=-1).tolist()
+            def _forward():
+                with torch.inference_mode():
+                    t = p(image).unsqueeze(0).to(next(m.parameters()).dtype)
+                    out = m(t)[0].float()
+                    return t, torch.softmax(out, dim=-1).tolist()
+
+            tensor, probs = _forward()
+            if len(probs) < 2 or not all(math.isfinite(x) for x in probs):
+                # Reintento con oneDNN desactivado: mismos pesos y mismo resultado esperado,
+                # pero evita los kernels de CPU que a veces devuelven NaN.
+                log.warning("⚠️ %s: salida no finita %s; reintentando sin oneDNN", model, probs)
+                with torch.backends.mkldnn.flags(enabled=False):
+                    tensor, probs = _forward()
             log.info("⏱️ %s: inferencia %.1fs", model, time.time() - t_inf)
 
         if len(probs) < 2 or not all(math.isfinite(x) for x in probs):
@@ -411,10 +431,10 @@ def run_prediction(model: str, image: Image.Image, fmt: str) -> dict:
                 "Salida no válida del modelo %s: %s | entrada finita: %s | primera capa con NaN/Inf: %s",
                 model, probs, input_ok, bad_layer,
             )
-            raise HTTPException(
-                status_code=422,
-                detail="This model returned an invalid result. Try another model.",
-            )
+            detail = "This model returned an invalid result. Try another model."
+            if DEBUG_ERRORS:
+                detail += f" [debug: input_finite={input_ok}, first_bad_layer={bad_layer}, probs={probs}]"
+            raise HTTPException(status_code=422, detail=detail)
 
         ai_score = probs[0]
         real_score = probs[1]
