@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageFilter, ExifTags, UnidentifiedImageError
 from torchvision import models, transforms
@@ -22,20 +23,67 @@ from config import MODEL_REPO, MAX_IMAGE_MB
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("imager-api")
 
+
+# ============================================================
+# HILOS DE CPU
+# ============================================================
+# En Railway torch ve todos los núcleos del servidor físico, pero el contenedor
+# solo tiene unos pocos vCPU. Eso provoca sobresuscripción y la inferencia pasa
+# de ~1 s a ~60 s. Limitamos los hilos a la cuota real del contenedor.
+def detect_cpu_limit() -> int:
+    env = os.getenv("TORCH_THREADS")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    try:
+        n = len(os.sched_getaffinity(0))
+    except Exception:
+        n = os.cpu_count() or 1
+    try:  # cgroup v2
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            n = min(n, max(1, math.ceil(int(quota) / int(period))))
+    except Exception:
+        try:  # cgroup v1
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+                quota = int(f.read())
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+                period = int(f.read())
+            if quota > 0:
+                n = min(n, max(1, math.ceil(quota / period)))
+        except Exception:
+            pass
+    return max(1, n)
+
+
+CPU_THREADS = detect_cpu_limit()
+torch.set_num_threads(CPU_THREADS)
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass
+log.info("🧵 Hilos de torch: %d", CPU_THREADS)
+
 # ============================================================
 # CONFIGURACIÓN DEL CACHÉ DE MODELOS
 # ============================================================
 # Tiempo (segundos) que un modelo se queda cargado tras la última petición
-MODEL_TTL_SECONDS = int(os.getenv("MODEL_TTL_SECONDS", "60"))  # 1 minuto sin uso
-CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "10"))  # revisar cada 10 s
+MODEL_TTL_SECONDS = int(os.getenv("MODEL_TTL_SECONDS", "900"))  # 15 min: evita recargas de ~1 min
+CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "30"))
+# Modelo que se carga en segundo plano al arrancar ("" para desactivar)
+PRELOAD_MODEL = os.getenv("PRELOAD_MODEL", MODEL_REPO)
 
-# Caché: {repo_id: {"model": m, "transform": t, "last_used": timestamp}}
+# Caché: {repo_id: {"model": m, "transform": t, "last_used": ts, "busy": n}}
 MODELS_CACHE = {}
 cache_lock = threading.Lock()
 LOAD_LOCK = threading.Lock()
+# Solo una inferencia a la vez: evita pelear por la poca CPU disponible.
+INFER_LOCK = threading.Lock()
 
-# bfloat16 usa la mitad de RAM que float32 para los pesos.
-# Para volver a float32 en Railway: MODEL_DTYPE=float32
+# Para usar bfloat16 (mitad de RAM): MODEL_DTYPE=bfloat16
 MODEL_DTYPE = (
     torch.float32
     if os.getenv("MODEL_DTYPE", "float32").lower() == "float32"
@@ -88,6 +136,29 @@ def release_memory():
         torch.cuda.empty_cache()
 
 
+def find_first_nonfinite_layer(m, tensor):
+    """Diagnóstico: repite la inferencia con hooks y devuelve la primera capa que produce NaN/Inf."""
+    found = []
+    hooks = []
+
+    def make_hook(name):
+        def hook(_module, _inputs, out):
+            if not found and torch.is_tensor(out) and out.is_floating_point() and not bool(torch.isfinite(out).all()):
+                found.append(name)
+        return hook
+
+    for name, module in m.named_modules():
+        if not list(module.children()):  # solo capas hoja
+            hooks.append(module.register_forward_hook(make_hook(name)))
+    try:
+        with torch.inference_mode():
+            m(tensor)
+    finally:
+        for h in hooks:
+            h.remove()
+    return found[0] if found else None
+
+
 def clean_json(obj):
     """Recorre la respuesta completa y reemplaza NaN/infinito por None."""
     if isinstance(obj, dict):
@@ -134,8 +205,17 @@ def unload_all_models():
         torch.cuda.empty_cache()
 
 
+def set_busy(repo_id: str, delta: int):
+    """Marca un modelo como en uso para que el limpiador no lo descargue a mitad de petición."""
+    with cache_lock:
+        entry = MODELS_CACHE.get(repo_id)
+        if entry is not None:
+            entry["busy"] = max(0, entry.get("busy", 0) + delta)
+            entry["last_used"] = time.time()
+
+
 def cleanup_worker():
-    """Hilo que cada 60s libera modelos inactivos."""
+    """Hilo que libera periódicamente los modelos inactivos."""
     while True:
         try:
             time.sleep(CLEANUP_INTERVAL)
@@ -143,6 +223,8 @@ def cleanup_worker():
             to_unload = []
             with cache_lock:
                 for repo_id, entry in MODELS_CACHE.items():
+                    if entry.get("busy", 0) > 0:
+                        continue
                     if now - entry["last_used"] > MODEL_TTL_SECONDS:
                         to_unload.append(repo_id)
             for repo_id in to_unload:
@@ -151,14 +233,6 @@ def cleanup_worker():
                 release_memory()
         except Exception as e:
             log.error("Cleanup worker error: %s", e)
-
-
-def _torch_load(path):
-    """Carga los pesos con mmap para no duplicar la RAM al leer el archivo."""
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
 
 
 def load_model_by_repo(repo_id: str):
@@ -186,13 +260,30 @@ def load_model_by_repo(repo_id: str):
 
         log.info("📥 Cargando modelo en RAM: %s", repo_id)
         weights_path = hf_hub_download(repo_id=repo_id, filename="pytorch_model.bin")
-        state_dict = _torch_load(weights_path)
+        # mmap=True: el archivo se lee de disco bajo demanda y NO se duplica en RAM.
+        # Sin assign=True: los pesos se COPIAN a un modelo float32 propio, así el modelo
+        # no depende de páginas mapeadas (esto evita los NaN). Resultado idéntico, menos pico de RAM.
+        try:
+            state_dict = torch.load(weights_path, map_location="cpu", weights_only=True, mmap=True)
+        except (TypeError, RuntimeError):
+            state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
 
         if isinstance(state_dict, dict):
             if "model" in state_dict:
                 state_dict = state_dict["model"]
             elif "state_dict" in state_dict:
                 state_dict = state_dict["state_dict"]
+
+        # Diagnóstico: ¿el checkpoint trae NaN/Inf en sus pesos?
+        ckpt_dtypes = sorted({str(v.dtype).replace("torch.", "") for v in state_dict.values() if torch.is_tensor(v)})
+        bad_tensors = [
+            k for k, v in state_dict.items()
+            if torch.is_tensor(v) and v.is_floating_point() and not bool(torch.isfinite(v).all())
+        ]
+        log.info("🔎 %s: dtypes del checkpoint = %s", repo_id, ckpt_dtypes)
+        if bad_tensors:
+            log.error("⚠️ %d tensores con NaN/Inf en el checkpoint de %s. Primeros: %s",
+                      len(bad_tensors), repo_id, bad_tensors[:8])
 
         arch = detect_architecture(state_dict)
 
@@ -206,11 +297,13 @@ def load_model_by_repo(repo_id: str):
             m = models.convnext_small(weights=None)
             m.classifier[2] = nn.Linear(m.classifier[2].in_features, 2)
 
-        m.load_state_dict(state_dict, strict=True, assign=True)
+        m = m.float()
+        m.load_state_dict(state_dict, strict=True)
         del state_dict
         gc.collect()
         m.eval()
-        m = m.to(MODEL_DTYPE)
+        if MODEL_DTYPE != torch.float32:
+            m = m.to(MODEL_DTYPE)
 
         p = transforms.Compose([
             transforms.Resize(256),
@@ -224,8 +317,10 @@ def load_model_by_repo(repo_id: str):
                 "model": m,
                 "transform": p,
                 "last_used": time.time(),
+                "busy": 0,
             }
 
+        release_memory()  # devuelve al sistema la RAM temporal usada durante la carga
         log.info("✅ Modelo cargado en RAM: %s (%s)", repo_id, arch)
         return m, p
 
@@ -280,18 +375,85 @@ def analyze_technical_signals(image: Image.Image) -> dict:
     return signals
 
 
+def run_prediction(model: str, image: Image.Image, fmt: str) -> dict:
+    """Parte pesada (carga + inferencia). Se ejecuta en un hilo, NO en el event loop."""
+    try:
+        technical = analyze_technical_signals(image)
+    except Exception as e:
+        technical = {"error": str(e)[:200]}
+
+    try:
+        m, p = load_model_by_repo(model)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log.exception("Model load failed")
+        raise HTTPException(status_code=503, detail=f"Model '{model}' unavailable: {str(e)[:200]}")
+
+    repo = normalize_repo(model)
+    set_busy(repo, +1)
+    try:
+        with INFER_LOCK:
+            t_inf = time.time()
+            with torch.inference_mode():
+                tensor = p(image).unsqueeze(0).to(next(m.parameters()).dtype)
+                logits = m(tensor)[0].float()
+                probs = torch.softmax(logits, dim=-1).tolist()
+            log.info("⏱️ %s: inferencia %.1fs", model, time.time() - t_inf)
+
+        if len(probs) < 2 or not all(math.isfinite(x) for x in probs):
+            input_ok = bool(torch.isfinite(tensor).all())
+            try:
+                bad_layer = find_first_nonfinite_layer(m, tensor)
+            except Exception as diag_err:
+                bad_layer = f"(no se pudo diagnosticar: {diag_err})"
+            log.error(
+                "Salida no válida del modelo %s: %s | entrada finita: %s | primera capa con NaN/Inf: %s",
+                model, probs, input_ok, bad_layer,
+            )
+            raise HTTPException(
+                status_code=422,
+                detail="This model returned an invalid result. Try another model.",
+            )
+
+        ai_score = probs[0]
+        real_score = probs[1]
+        is_ai = ai_score >= real_score
+
+        return clean_json({
+            "model_repo": model,
+            "label": "AI-Generated" if is_ai else "Real Image",
+            "isAI": is_ai,
+            "confidence": round(max(ai_score, real_score) * 100, 2),
+            "aiScore": round(ai_score * 100, 2),
+            "realScore": round(real_score * 100, 2),
+            "technical_signals": technical,
+        })
+    finally:
+        set_busy(repo, -1)
+
+
 # ============================================================
 # APP
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     threading.Thread(target=cleanup_worker, daemon=True).start()
+
+    def _preload():
+        try:
+            if PRELOAD_MODEL:
+                load_model_by_repo(PRELOAD_MODEL)
+        except Exception as e:
+            log.error("Preload failed: %s", e)
+
+    threading.Thread(target=_preload, daemon=True).start()
     log.info("🚀 Backend iniciado (lazy loading activado, TTL=%ds)", MODEL_TTL_SECONDS)
     yield
     unload_all_models()
 
 
-app = FastAPI(title="Imager Model API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Imager Model API", version="3.1.0", lifespan=lifespan)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -309,6 +471,7 @@ def root():
         "loaded_models": loaded,
         "allowed_models": sorted(ALLOWED_NORMALIZED),
         "ttl_seconds": MODEL_TTL_SECONDS,
+        "torch_threads": CPU_THREADS,
     }
 
 
@@ -332,54 +495,18 @@ async def predict(
         raise HTTPException(status_code=413, detail=f"Max {MAX_IMAGE_MB} MB.")
 
     try:
-        image = Image.open(io.BytesIO(data)).convert("RGB")
+        image = Image.open(io.BytesIO(data))
+        fmt = image.format or "unknown"
+        image = image.convert("RGB")
         image.load()
+        image.format = fmt  # convert() pierde el formato original
     except (UnidentifiedImageError, OSError):
         raise HTTPException(status_code=400, detail="Invalid image.")
 
     try:
-        technical = analyze_technical_signals(image)
-    except Exception as e:
-        technical = {"error": str(e)[:200]}
-
-    try:
-        m, p = load_model_by_repo(model)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        log.exception("Model load failed")
-        raise HTTPException(status_code=503, detail=f"Model '{model}' unavailable: {str(e)[:200]}")
-
-    try:
-        with torch.inference_mode():
-            tensor = p(image).unsqueeze(0).to(next(m.parameters()).dtype)
-            logits = m(tensor)[0].float()
-            probs = torch.softmax(logits, dim=-1).tolist()
-
-        with cache_lock:
-            if normalize_repo(model) in MODELS_CACHE:
-                MODELS_CACHE[normalize_repo(model)]["last_used"] = time.time()
-
-        if len(probs) < 2 or not all(math.isfinite(p) for p in probs):
-            log.error("Salida no válida del modelo %s: %s", model, probs)
-            raise HTTPException(
-                status_code=422,
-                detail="The model could not analyze this image. Try another one.",
-            )
-
-        ai_score = probs[0]
-        real_score = probs[1]
-        is_ai = ai_score >= real_score
-
-        return clean_json({
-            "model_repo": model,
-            "label": "AI-Generated" if is_ai else "Real Image",
-            "isAI": is_ai,
-            "confidence": round(max(ai_score, real_score) * 100, 2),
-            "aiScore": round(ai_score * 100, 2),
-            "realScore": round(real_score * 100, 2),
-            "technical_signals": technical,
-        })
+        # En un hilo aparte: así el servidor sigue respondiendo (/health, CORS, otras
+        # peticiones) mientras se carga el modelo o se hace la inferencia.
+        return await run_in_threadpool(run_prediction, model, image, fmt)
     except HTTPException:
         raise
     except Exception as exc:
